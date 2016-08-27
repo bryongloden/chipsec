@@ -71,7 +71,14 @@ NVRAM_ATTR_AUTHWR     = 0x40
 NVRAM_ATTR_HER        = 0x20
 NVRAM_ATTR_VLD        = 0x80
 
-VARIABLE_STORE_FV_GUID = 'FFF12B8D-7696-4C8B-A985-2747075B4F50'
+#
+# Known GUIDs of NVRAM stored in EFI firmware volumes, FS files etc. of various firmware implementations
+#
+VARIABLE_STORE_FV_GUID   = 'FFF12B8D-7696-4C8B-A985-2747075B4F50'
+ADDITIONAL_NV_STORE_GUID = '00504624-8A59-4EEB-BD0F-6B36E96128E0'
+NVAR_NVRAM_FS_FILE       = "CEF5B9A3-476D-497F-9FDC-E98143E0422C"
+
+EFI_NVRAM_GUIDS = [VARIABLE_STORE_FV_GUID, ADDITIONAL_NV_STORE_GUID, NVAR_NVRAM_FS_FILE]
 
 #################################################################################################3
 # This Variable header is defined by UEFI
@@ -248,11 +255,14 @@ State      : 0x%02X
 """ % ( self.StartId, self.TotalSize, self.Reserved1, self.Reserved2, self.Reserved3, self.Attributes, self.State )
 
 NVAR_EFIvar_signature   = 'NVAR'
-NVAR_NVRAM_FS_FILE      = "CEF5B9A3-476D-497F-9FDC-E98143E0422C"
 
 def getNVstore_NVAR( nvram_buf ):
     l = (-1, -1, None)
     FvOffset, FsGuid, FvLength, FvAttributes, FvHeaderLength, FvChecksum, ExtHeaderOffset, FvImage, CalcSum = NextFwVolume(nvram_buf)
+    if (FvOffset >= len(nvram_buf)):
+        return l
+    if (FvOffset + FvLength) > len(nvram_buf):
+        FvLength = len(nvram_buf) - FvOffset
     while FvOffset != None:
         polarity = bit_set(FvAttributes, EFI_FVB2_ERASE_POLARITY)
         cur_offset, next_offset, Name, Type, Attributes, State, Checksum, Size, FileImage, HeaderSize, UD, fCalcSum = NextFwFile(FvImage, FvLength, FvHeaderLength, polarity)
@@ -535,7 +545,6 @@ def getEFIvariables_VSS_APPLE( nvram_buf ):
 #
 #
 VARIABLE_STORE_SIGNATURE_EVSA = 'EVSA'
-ADDITIONAL_NV_STORE_GUID = '00504624-8A59-4EEB-BD0F-6B36E96128E0'
 
 TLV_HEADER = "<BBH"
 tlv_h_size = struct.calcsize(TLV_HEADER)
@@ -951,9 +960,15 @@ def parse_s3bootscript_entry( s3bootscript_type, script, off, log_script=False )
     opcode       = None
     entry_data   = None
 
+    remaining_len = len(script[off:])
+
     if S3BootScriptType.EFI_BOOT_SCRIPT_TYPE_EDKCOMPAT == s3bootscript_type:
         fhdr = '<HB'
         hdr_length = struct.calcsize(fhdr)
+        if remaining_len < hdr_length:
+            if logger().VERBOSE: logger().warn( 'the script should have at least 0x%X bytes to parse next entry' % hdr_length )
+            return (0,None)
+
         opcode, entry_length = struct.unpack( fhdr, script[ off : off + hdr_length ] )
         if S3BootScriptOpcode_EdkCompat.EFI_BOOT_SCRIPT_TERMINATE_OPCODE == opcode:
             entry_length = hdr_length
@@ -961,7 +976,7 @@ def parse_s3bootscript_entry( s3bootscript_type, script, off, log_script=False )
 
         if entry_length > MAX_S3_BOOTSCRIPT_ENTRY_LENGTH:
             logger().error( '[uefi] Unrecognized S3 boot script format (entry length = 0x%X)' % entry_length )
-            return None
+            return (0,None)
 
         s3script_entry = S3BOOTSCRIPT_ENTRY( s3bootscript_type, entry_index, off, entry_length, entry_data )
 
@@ -970,6 +985,10 @@ def parse_s3bootscript_entry( s3bootscript_type, script, off, log_script=False )
         fhdr       = '<II' 
         hdr_length = struct.calcsize(fhdr)
         f          = fhdr + 'B'
+        if remaining_len < (hdr_length + 1):
+            if logger().VERBOSE: logger().warn( 'the script should have at least 0x%X bytes to parse next entry' % (hdr_length+1) )
+            return (0,None)
+
         entry_index, entry_length, opcode = struct.unpack(f, script[ off : off + hdr_length + 1 ])
         if S3BootScriptOpcode_MDE.EFI_BOOT_SCRIPT_TERMINATE_OPCODE == opcode:
             entry_length = hdr_length + 1
@@ -978,7 +997,7 @@ def parse_s3bootscript_entry( s3bootscript_type, script, off, log_script=False )
 
         if entry_length > MAX_S3_BOOTSCRIPT_ENTRY_LENGTH:
             logger().error( '[uefi] Unrecognized S3 boot script format (entry length = 0x%X)' % entry_length )
-            return None
+            return (0,None)
 
         s3script_entry                = S3BOOTSCRIPT_ENTRY( s3bootscript_type, entry_index, off, entry_length, entry_data )
         s3script_entry.header_length  = hdr_length

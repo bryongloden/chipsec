@@ -1,6 +1,6 @@
 #!/usr/local/bin/python
 #CHIPSEC: Platform Security Assessment Framework
-#Copyright (c) 2010-2015, Intel Corporation
+#Copyright (c) 2010-2016, Intel Corporation
 # 
 #This program is free software; you can redistribute it and/or
 #modify it under the terms of the GNU General Public License
@@ -60,18 +60,18 @@ class CPU:
         
     def read_cr(self, cpu_thread_id, cr_number ):
         value = self.helper.read_cr( cpu_thread_id, cr_number )
-        if logger().HAL: logger().log( "[cpu%d] read CR%d: value = 0x%08X" % (cpu_thread_id, cr_number, value) )
+        if logger().VERBOSE: logger().log( "[cpu%d] read CR%d: value = 0x%08X" % (cpu_thread_id, cr_number, value) )
         return value
 
     def write_cr(self, cpu_thread_id, cr_number, value ):
-        if logger().HAL: logger().log( "[cpu%d] write CR%d: value = 0x%08X" % (cpu_thread_id, cr_number, value) )
+        if logger().VERBOSE: logger().log( "[cpu%d] write CR%d: value = 0x%08X" % (cpu_thread_id, cr_number, value) )
         status = self.helper.write_cr( cpu_thread_id, cr_number, value )
         return status
 
     def cpuid(self, eax, ecx ):
-        if logger().HAL: logger().log( "[cpu] CPUID in : EAX=0x%08X, ECX=0x%08X" % (eax, ecx) )
-        (eax, ebx, ecx, edx) = self.cs.cpuid.cpuid( eax, ecx )
-        if logger().HAL: logger().log( "[cpu] CPUID out: EAX=0x%08X, EBX=0x%08X, ECX=0x%08X, EDX=0x%08X" % (eax, ebx, ecx, edx) )
+        if logger().VERBOSE: logger().log( "[cpu] CPUID in : EAX=0x%08X, ECX=0x%08X" % (eax, ecx) )
+        (eax, ebx, ecx, edx) = self.helper.cpuid( eax, ecx )
+        if logger().VERBOSE: logger().log( "[cpu] CPUID out: EAX=0x%08X, EBX=0x%08X, ECX=0x%08X, EDX=0x%08X" % (eax, ebx, ecx, edx) )
         return (eax, ebx, ecx, edx)
 
     # Using CPUID we can determine if Hyper-Threading is enabled in the CPU
@@ -153,7 +153,9 @@ class CPU:
     # Returns SMRAM base from either SMRR MSR or TSEG PCIe config register
     #
     def get_SMRAM( self ):
-        smram_base = None
+        smram_base  = None
+        smram_limit = None
+        smram_size  = 0
         try:
             (smram_base, smram_limit, smram_size) = self.get_SMRR_SMRAM()
         except:
@@ -174,4 +176,24 @@ class CPU:
         if logger().VERBOSE: chipsec.chipset.print_register( self.cs, 'MTRRCAP', mtrrcap_msr_reg )
         smrr = chipsec.chipset.get_register_field( self.cs, 'MTRRCAP', mtrrcap_msr_reg, 'SMRR' )
         return (1 == smrr)
+
+    #
+    # Dump CPU page tables at specified physical base of paging-directory hierarchy (CR3)
+    #
+    def dump_page_tables( self, cr3, pt_fname=None ):
+        _orig_logname = logger().LOG_FILE_NAME
+        hpt = chipsec.hal.paging.c_ia32e_page_tables( self.cs )
+        if logger().HAL: logger().log( '[cpu] dumping paging hierarchy at physical base (CR3) = 0x%08X...' % cr3 )
+        if pt_fname is None: pt_fname = ('pt_%08X' % cr3)
+        logger().set_log_file( pt_fname )
+        hpt.read_pt_and_show_status( pt_fname, 'PT', cr3 )
+        logger().set_log_file( _orig_logname )
+        if hpt.failure: logger().error( 'could not dump page tables' )
+
+    def dump_page_tables_all( self ):
+        for tid in range(self.cs.msr.get_cpu_thread_count()):
+            cr3 = self.read_cr( tid, 3 )
+            if logger().HAL: logger().log( '[cpu%d] found paging hierarchy base (CR3): 0x%08X' % (tid,cr3) )
+            self.dump_page_tables( cr3 )
+
     

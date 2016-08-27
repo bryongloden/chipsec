@@ -46,9 +46,14 @@ from chipsec.helper.oshelper import OsHelperError, Helper
 from chipsec.logger import logger, print_buffer
 import errno
 import array
+import subprocess
+import os.path
 import chipsec.file
 
 from ctypes import *
+
+MSGBUS_MDR_IN_MASK  = 0x1
+MSGBUS_MDR_OUT_MASK = 0x2
 
 IOCTL_BASE                     = 0x0
 IOCTL_RDIO                     = 0x1
@@ -70,12 +75,17 @@ IOCTL_WRCR                     = 0x11
 IOCTL_RDMMIO                   = 0x12
 IOCTL_WRMMIO                   = 0x13
 IOCTL_VA2PA                    = 0x14
+IOCTL_MSGBUS_SEND_MESSAGE      = 0x15
 
 class LinuxHelper(Helper):
 
     DEVICE_NAME = "/dev/chipsec"
+    DEV_MEM = "/dev/mem"
+    MODULE_NAME = "chipsec"
+    SUPPORT_KERNEL26_GET_PAGE_IS_RAM = False
 
     def __init__(self):
+        super(LinuxHelper, self).__init__()
         import platform
         self.os_system  = platform.system()
         self.os_release = platform.release()
@@ -83,6 +93,7 @@ class LinuxHelper(Helper):
         self.os_machine = platform.machine()
         self.os_uname   = platform.uname()
         self.dev_fh = None
+        self.dev_mem = None
 
     def __del__(self):
         try:
@@ -94,16 +105,46 @@ class LinuxHelper(Helper):
 # Driver/service management functions
 ###############################################################################################
 
-    def create( self ):
-        self.init()
+    # This function load CHIPSEC driver. (implement functionality from run.sh)
+    def load_chipsec_module(self):
+        page_is_ram = ""
+        a1 = ""
+        if self.SUPPORT_KERNEL26_GET_PAGE_IS_RAM:
+            page_is_ram = self.get_page_is_ram()
+            if not page_is_ram:
+                if logger().VERBOSE:
+                    logger().log("Cannot find symbol 'page_is_ram'")
+            else:
+                a1 = "a1=0x%s" % page_is_ram 
+        driver_path = os.path.join(chipsec.file.get_main_dir(), ".." , "drivers" ,"linux", "chipsec.ko" )
+        subprocess.check_output( [ "insmod", driver_path, a1 ] )
+        uid = gid = 0
+        os.chown(self.DEVICE_NAME, uid, gid)
+        os.chmod(self.DEVICE_NAME, 600)
+        if os.path.exists(self.DEVICE_NAME):
+            if logger().VERBOSE:
+                logger().log("Module %s loaded successfully"%self.DEVICE_NAME)
+        else:
+            logger().error( "Fail to load module: %s" % driver_path )
+
+
+    def create(self, start_driver):
         if logger().VERBOSE:
             logger().log("[helper] Linux Helper created")
 
-    def start( self ):
+    def start(self, start_driver):
+        if start_driver:
+            if os.path.exists(self.DEVICE_NAME):
+                subprocess.call(["rmmod", self.MODULE_NAME])
+            self.load_chipsec_module()
+        self.init(start_driver)
         if logger().VERBOSE:
             logger().log("[helper] Linux Helper started/loaded")
 
     def stop( self ):
+        self.close()
+        if self.driver_loaded:
+            subprocess.call(["rmmod", self.MODULE_NAME])
         if logger().VERBOSE:
             logger().log("[helper] Linux Helper stopped/unloaded")
 
@@ -115,26 +156,53 @@ class LinuxHelper(Helper):
         self.stop()
         self.delete()
 
-    def init( self ):
+    def init(self, start_driver):
         x64 = True if sys.maxsize > 2**32 else False
         self._pack = 'Q' if x64 else 'I'
 
-        logger().log("\n****** Chipsec Linux Kernel module is licensed under GPL 2.0\n")
+        if start_driver:
+            logger().log("****** Chipsec Linux Kernel module is licensed under GPL 2.0")
 
-        try:
-            self.dev_fh = open(self.DEVICE_NAME, "r+")
-        except IOError as e:
-            raise OsHelperError("Unable to open chipsec device. Did you run as root/sudo and load the driver?\n %s"%str(e),e.errno)
-        except BaseException as be:
-            raise OsHelperError("Unable to open chipsec device. Did you run as root/sudo and load the driver?\n %s"%str(be),errno.ENXIO)
+            try:
+                self.dev_fh = open(self.DEVICE_NAME, "r+")
+                self.driver_loaded = True
+            except IOError as e:
+                raise OsHelperError("Unable to open chipsec device. Did you run as root/sudo and load the driver?\n %s"%str(e),e.errno)
+            except BaseException as be:
+                raise OsHelperError("Unable to open chipsec device. Did you run as root/sudo and load the driver?\n %s"%str(be),errno.ENXIO)
 
-        self._ioctl_base = fcntl.ioctl(self.dev_fh, IOCTL_BASE) << 4
+            self._ioctl_base = fcntl.ioctl(self.dev_fh, IOCTL_BASE) << 4
 
+    def devmem_available(self):
+        """Check if /dev/mem is usable.
+
+           In case the driver is not loaded, we might be able to perform the
+           requested operation via /dev/mem. Returns True if /dev/mem is
+           accessible.
+        """
+        if self.dev_mem:
+            return True
+        if not self.driver_loaded:
+            logger().log("[helper] Trying /dev/mem instead of the Chipsec driver.")
+            try:
+                self.dev_mem = os.open(self.DEV_MEM, os.O_RDWR)
+                return True
+            except IOError as err:
+                raise OsHelperError("Unable to open /dev/mem.\n"
+                                    "This command requires either the Chipsec"
+                                    "driver or access to /dev/mem.\n"
+                                    "Are you running this command as root?\n"
+                                    "%s" % str(err), err.errno)
+        return False
 
     def close(self):
         if self.dev_fh:
             self.dev_fh.close()
         self.dev_fh = None
+        if self.dev_mem:
+            os.close(self.dev_mem)
+        self.dev_mem = None
+
 
     def ioctl(self, nr, args, *mutate_flag):
         return fcntl.ioctl(self.dev_fh, self._ioctl_base + nr, args)
@@ -151,12 +219,22 @@ class LinuxHelper(Helper):
         return 1
 
     def mem_read_block(self, addr, sz):
-        if(addr != None): self.dev_fh.seek(addr)
-        return self.__mem_block(sz)
+        if self.driver_loaded:
+            if(addr != None): self.dev_fh.seek(addr)
+            return self.__mem_block(sz)
+        elif self.devmem_available():
+            os.lseek(self.dev_mem, addr, os.SEEK_SET)
+            return os.read(self.dev_mem, sz)
 
     def mem_write_block(self, addr, sz, newval):
-        if(addr != None): self.dev_fh.seek(addr)
-        return self.__mem_block(sz, newval)
+        if self.driver_loaded:
+            if(addr != None): self.dev_fh.seek(addr)
+            return self.__mem_block(sz, newval)
+        elif self.devmem_available():
+            os.lseek(self.dev_mem, addr, os.SEEK_SET)
+            written = os.write(self.dev_mem, newval)
+            if written != sz:
+                logger().error("Cannot write %s to memory %016x (wrote %d of %d)" % (newval, addr, written, sz))
 
     def write_phys_mem(self, phys_address_hi, phys_address_lo, sz, newval):
         if(newval == None): return None
@@ -185,8 +263,29 @@ class LinuxHelper(Helper):
     def read_pci( self, bus, device, function, address ):
         return self.read_pci_reg(bus, device, function, address)
 
+    def read_pci_reg_from_sys(self, bus, device, function, offset, size, domain=0):
+        device_name = "{domain:04x}:{bus:02x}:{device:02x}.{function}".format(
+                      domain=domain, bus=bus, device=device, function=function)
+        device_path = "/sys/bus/pci/devices/{}/config".format(device_name)
+        try:
+            config = open(device_path, "rb")
+        except IOError as err:
+            raise OsHelperError("Unable to open {}".format(device_path), err.errno)
+        config.seek(offset)
+        reg = config.read(size)
+        config.close()
+        if size == 4:
+          reg = struct.unpack("=I", reg)[0]
+        elif size == 2:
+          reg = struct.unpack("=H", reg)[0]
+        elif size == 1:
+          reg = struct.unpack("=B", reg)[0]
+        return reg
+
     def read_pci_reg( self, bus, device, function, offset, size = 4 ):
         _PCI_DOM = 0 #Change PCI domain, if there is more than one.
+        if not self.driver_loaded:
+            return self.read_pci_reg_from_sys(bus, device, function, offset, size, domain=_PCI_DOM)
         d = struct.pack("5"+self._pack, ((_PCI_DOM << 16) | bus), ((device << 16) | function), offset, size, 0)
         try:
             ret = self.ioctl(IOCTL_RDPCI, d)
@@ -253,7 +352,6 @@ class LinuxHelper(Helper):
 
     def write_cr(self, cpu_thread_id, cr_number, value):
         self.set_affinity(cpu_thread_id)
-        print "Writing CR 0x%x with value = 0x%x" % (cr_number, value)
         in_buf = struct.pack( "3"+self._pack, cpu_thread_id, cr_number, value )
         self.ioctl(IOCTL_WRCR, in_buf)
         return
@@ -267,7 +365,6 @@ class LinuxHelper(Helper):
 
     def write_msr(self, thread_id, msr_addr, eax, edx):
         self.set_affinity(thread_id)
-        print "Writing msr 0x%x with eax = 0x%x, edx = 0x%x" % (msr_addr, eax, edx)
         in_buf = struct.pack( "4"+self._pack, thread_id, msr_addr, edx, eax )
         self.ioctl(IOCTL_WRMSR, in_buf)
         return
@@ -299,24 +396,42 @@ class LinuxHelper(Helper):
         return struct.unpack( "2"+self._pack, out_buf )
 
     def read_mmio_reg(self, phys_address, size):
-        in_buf = struct.pack( "2"+self._pack, phys_address, size)
-        out_buf = self.ioctl(IOCTL_RDMMIO, in_buf)
+        if self.driver_loaded:
+            in_buf = struct.pack( "2"+self._pack, phys_address, size)
+            out_buf = self.ioctl(IOCTL_RDMMIO, in_buf)
+            reg = out_buf[:size]
+        elif self.devmem_available():
+            os.lseek(self.dev_mem, phys_address, os.SEEK_SET)
+            reg = os.read(self.dev_mem, size)
+
         if size == 8:
-            value = struct.unpack( '=Q', out_buf[:size] )[0]
+            value = struct.unpack( '=Q', reg)[0]
         elif size == 4:
-            value = struct.unpack( '=I', out_buf[:size] )[0]
+            value = struct.unpack( '=I', reg)[0]
         elif size == 2:
-            value = struct.unpack( '=H', out_buf[:size] )[0]
+            value = struct.unpack( '=H', reg)[0]
         elif size == 1:
-            value = struct.unpack( '=B', out_buf[:size] )[0]
-        else: value = 0
+            value = struct.unpack( '=B', reg)[0]
+        else:
+            value = 0
         return value
 
     def write_mmio_reg(self, phys_address, size, value):
-        in_buf = struct.pack( "3"+self._pack, phys_address, size, value )
-        out_buf = self.ioctl(IOCTL_WRMMIO, in_buf)
-        return
-        
+        if self.driver_loaded:
+            in_buf = struct.pack( "3"+self._pack, phys_address, size, value )
+            out_buf = self.ioctl(IOCTL_WRMMIO, in_buf)
+        elif self.devmem_available():
+            if size == 4:
+                reg = struct.pack("=I", value)
+            elif size == 2:
+                reg = struct.pack("=H", value)
+            elif size == 1:
+                reg = struct.pack("=B", value)
+            os.lseek(self.dev_mem, phys_address, os.SEEK_SET)
+            written = os.write(self.dev_mem, reg)
+            if written != size:
+                logger().error("Unable to write all data to MMIO (wrote %d of %d)" % (written, size))
+
     def kern_get_EFI_variable_full(self, name, guid):
         status_dict = { 0:"EFI_SUCCESS", 1:"EFI_LOAD_ERROR", 2:"EFI_INVALID_PARAMETER", 3:"EFI_UNSUPPORTED", 4:"EFI_BAD_BUFFER_SIZE", 5:"EFI_BUFFER_TOO_SMALL", 6:"EFI_NOT_READY", 7:"EFI_DEVICE_ERROR", 8:"EFI_WRITE_PROTECTED", 9:"EFI_OUT_OF_RESOURCES", 14:"EFI_NOT_FOUND", 26:"EFI_SECURITY_VIOLATION" }
         off = 0
@@ -442,6 +557,33 @@ class LinuxHelper(Helper):
         logger().error( "ACPI is not supported yet" )
         return 0  
         
+    #
+    # IOSF Message Bus access
+    #
+    def msgbus_send_read_message( self, mcr, mcrx ):
+        mdr_out = 0
+        in_buf  = struct.pack( "5"+self._pack, MSGBUS_MDR_OUT_MASK, mcr, mcrx, 0, mdr_out )
+        out_buf = self.ioctl( IOCTL_MSGBUS_SEND_MESSAGE, in_buf )
+        mdr_out = struct.unpack( "5"+self._pack, out_buf )[4]
+        return mdr_out
+
+    def msgbus_send_write_message( self, mcr, mcrx, mdr ):
+        in_buf  = struct.pack( "5"+self._pack, MSGBUS_MDR_IN_MASK, mcr, mcrx, mdr, 0 )
+        out_buf = self.ioctl( IOCTL_MSGBUS_SEND_MESSAGE, in_buf )
+        return
+
+    def msgbus_send_message( self, mcr, mcrx, mdr=None ):
+        mdr_out = 0
+        if mdr is None: in_buf = struct.pack( "5"+self._pack, MSGBUS_MDR_OUT_MASK, mcr, mcrx, 0, mdr_out )
+        else:           in_buf = struct.pack( "5"+self._pack, (MSGBUS_MDR_IN_MASK | MSGBUS_MDR_OUT_MASK), mcr, mcrx, mdr, mdr_out )
+        out_buf = self.ioctl( IOCTL_MSGBUS_SEND_MESSAGE, in_buf )
+        mdr_out = struct.unpack( "5"+self._pack, out_buf )[4]
+        return mdr_out
+
+    #
+    # Affinity functions
+    #
+
     def get_affinity(self):
         CORES = ctypes.cdll.LoadLibrary( os.path.join(chipsec.file.get_main_dir( ), 'chipsec/helper/linux/cores.so' ) )
         CORES.getaffinity.argtypes = [ ctypes.c_int, POINTER( ( ctypes.c_long * 128 ) ),POINTER( ctypes.c_int ) ]
@@ -719,7 +861,6 @@ class LinuxHelper(Helper):
     #
     def send_sw_smi( self, cpu_thread_id, SMI_code_data, _rax, _rbx, _rcx, _rdx, _rsi, _rdi ):
         self.set_affinity(cpu_thread_id)
-        #print "Sending SW SMI 0x%x with rax = 0x%x, rbx = 0x%x, rcx = 0x%x, rdx = 0x%x, rsi = 0x%x, rdi = 0x%x" % (SMI_code_data, _rax, _rbx, _rcx, _rdx, _rsi, _rdi)
         in_buf = struct.pack( "7"+self._pack, SMI_code_data, _rax, _rbx, _rcx, _rdx, _rsi, _rdi )
         self.ioctl(IOCTL_SWSMI, in_buf)
         return
@@ -729,7 +870,8 @@ class LinuxHelper(Helper):
     # File system
     #
     def get_tools_path( self ):
-        return os.path.join('..','..','tools','edk2','linux')
+        p = os.path.join(chipsec.file.get_main_dir(), "..", "..", 'tools','edk2','linux')
+        return os.path.normpath(p)
 
     def get_compression_tool_path( self, compression_type ):
         tool = None
@@ -752,7 +894,12 @@ class LinuxHelper(Helper):
     def getcwd( self ):
         return os.getcwd()
 
-
+    def get_page_is_ram( self ):
+        PROC_KALLSYMS = "/proc/kallsyms"
+        symarr = chipsec.file.read_file(PROC_KALLSYMS).splitlines()
+        for line in symarr:
+            if "page_is_ram" in line:
+               return line.split(" ")[0]
     #
     # Logical CPU count
     #

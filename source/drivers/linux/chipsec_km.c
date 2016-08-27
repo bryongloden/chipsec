@@ -20,7 +20,6 @@ chipsec@intel.com
 */ 
 
 #include <linux/module.h>
-#include <linux/device.h>
 #include <linux/highmem.h>
 #include <linux/kallsyms.h>
 #include <linux/tty.h>
@@ -28,55 +27,47 @@ chipsec@intel.com
 #include <linux/version.h>
 #include <linux/slab.h>
 #include <asm/io.h>
-#include "include/chipsec.h"
 #include <linux/smp.h>
 #include <linux/efi.h>
-#include <linux/proc_fs.h>
+#include <linux/miscdevice.h>
+
+#include "include/chipsec.h"
 
 #define _GNU_SOURCE 
 #define CHIPSEC_VER_ 		1
 #define CHIPSEC_VER_MINOR	2
 
-
 MODULE_LICENSE("GPL");
-
-int chipsec_mem_major = -1;
 
 // function page_is_ram is not exported 
 // for modules, but is available in kallsyms.
 // So we need determine this address using dirty tricks
 int (*guess_page_is_ram)(unsigned long pagenr);
-int (*guess_raw_pci_read)(unsigned int domain, unsigned int bus, unsigned int devfn, int reg, int len, uint32_t *val);
-int (*guess_raw_pci_write)(unsigned int domain, unsigned int bus, unsigned int devfn, int reg, int len, uint32_t val);
 
 unsigned long a1=0;
 module_param(a1,ulong,0); //a1 is addr of page_is_ram function
-unsigned long a2=0;
-module_param(a2,ulong,0); //a2 is addr of raw_pci_read function
-unsigned long a3=0;
-module_param(a3,ulong,0); //a3 is addr of raw_pci_write function
 
 /// Char we show before each debug print
 const char program_name[] = "chipsec";
 
 typedef struct tagCONTEXT {
-   unsigned int a;   // rax - 0x00; eax - 0x0
-   unsigned int b;   // rbx - 0x08; ebx - 0x4
-   unsigned int c;   // rcx - 0x10; ecx - 0x8
-   unsigned int d;   // rdx - 0x18; edx - 0xc
+   unsigned long a;   // rax - 0x00; eax - 0x0
+   unsigned long b;   // rbx - 0x08; ebx - 0x4
+   unsigned long c;   // rcx - 0x10; ecx - 0x8
+   unsigned long d;   // rdx - 0x18; edx - 0xc
 } CONTEXT, *PCONTEXT;
 typedef CONTEXT CPUID_CTX, *PCPUID_CTX;
 
   void __cpuid__(CPUID_CTX * ctx);
 
 typedef struct tagSMI_CONTEXT {
-   unsigned int c;     // rcx - 0x00;
-   unsigned int d;     // rdx - 0x08;
-   unsigned int r8;     // r8 - 0x10;
-   unsigned int r9;     // r9 - 0x18;
-   unsigned int r10;   // r10 - 0x20;
-   unsigned int r11;   // r11 - 0x28;
-   unsigned int r12;   // r12 - 0x30;
+   unsigned long c;     // rcx - 0x00;
+   unsigned long d;     // rdx - 0x08;
+   unsigned long r8;     // r8 - 0x10;
+   unsigned long r9;     // r9 - 0x18;
+   unsigned long r10;   // r10 - 0x20;
+   unsigned long r11;   // r11 - 0x28;
+   unsigned long r12;   // r12 - 0x30;
 } SMI_CONTEXT, *SMI_PCONTEXT;
 
 typedef SMI_CONTEXT SMI_CTX, *PSMI_CTX; 
@@ -167,20 +158,20 @@ typedef SMI_CONTEXT SMI_CTX, *PSMI_CTX;
     unsigned short	cfg_data_port    // rsi
     );
 
-    unsigned int ReadCR0(void);
-    unsigned int ReadCR2(void);
-    unsigned int ReadCR3(void);
-    unsigned int ReadCR4(void);
+    unsigned long ReadCR0(void);
+    unsigned long ReadCR2(void);
+    unsigned long ReadCR3(void);
+    unsigned long ReadCR4(void);
 #ifdef __x86_64__
-    unsigned int ReadCR8(void);
+    unsigned long ReadCR8(void);
 #endif
 
-    void WriteCR0( unsigned int );
-    void WriteCR2( unsigned int );
-    void WriteCR3( unsigned int );
-    void WriteCR4( unsigned int );
+    void WriteCR0( unsigned long );
+    void WriteCR2( unsigned long );
+    void WriteCR3( unsigned long );
+    void WriteCR4( unsigned long );
 #ifdef __x86_64__
-    void WriteCR8( unsigned int );
+    void WriteCR8( unsigned long );
 #endif
 
     void __cpuid__(CPUID_CTX * ctx);
@@ -535,6 +526,8 @@ static loff_t memory_lseek(struct file * file, loff_t offset, int orig)
 //Older kernels (<20) uses f_dentry instead of f_path.dentry
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,20)
 	mutex_lock(&file->f_dentry->d_inode->i_mutex);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0)
+	inode_lock(file->f_path.dentry->d_inode);
 #else
 	mutex_lock(&file->f_path.dentry->d_inode->i_mutex);
 #endif 
@@ -556,6 +549,8 @@ static loff_t memory_lseek(struct file * file, loff_t offset, int orig)
 //Older kernels (<20) uses f_dentry instead of f_path.dentry
 #if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,20)
 	mutex_unlock(&file->f_dentry->d_inode->i_mutex);
+#elif LINUX_VERSION_CODE >= KERNEL_VERSION(4,7,0)
+	inode_unlock(file->f_path.dentry->d_inode);
 #else
 	mutex_unlock(&file->f_path.dentry->d_inode->i_mutex);
 #endif 
@@ -570,7 +565,7 @@ void * patch_apply_ucode(void * ucode_buf)
 
 	printk(KERN_INFO "[chipsec] [patch_apply_ucode] Applying patch in the processor id: %d", smp_processor_id());
 
-	ucode_start=(unsigned long long) ucode_buf;
+	ucode_start = (unsigned long long)ucode_buf;
 	asm volatile("wrmsr" :  : "c"(MSR_IA32_BIOS_UPDT_TRIG),"d"((unsigned int)((ucode_start >> 32) & 0xffffffff)),"a"((unsigned int)(ucode_start & 0xffffffff))); // lo is in eax
 
 
@@ -585,22 +580,24 @@ void * patch_bios_sign(void * ucode_buf)
 
 void * patch_cpuid_0(void * CPUInfo)
 {
-	int *pointer;
-	pointer=(int *) CPUInfo;
+	unsigned long *pointer;
+	pointer=(unsigned long *) CPUInfo;
 	asm volatile( "cpuid" : "=a"(pointer[0]),"=b"(pointer[1]),"=c"(pointer[2]),"=d"(pointer[3]) : "a"((unsigned int)(1)));
 	return NULL;
 }
 
 void * patch_read_msr(void * CPUInfo)
 {
-	int *pointer;
-	pointer=(int *) CPUInfo;
+	unsigned long *pointer;
+	pointer=(unsigned long *) CPUInfo;
 	asm volatile("rdmsr" : "=a"(pointer[0]), "=d"(pointer[3]) : "c"(MSR_IA32_BIOS_SIGN_ID));
 	return NULL;
 }
 
+
 void print_stat(efi_status_t stat)
 {
+#ifdef EFI_NOT_READY
     switch (stat) {
         case EFI_SUCCESS:
             printk( KERN_DEBUG "EFI_SUCCESS\n");
@@ -642,19 +639,20 @@ void print_stat(efi_status_t stat)
             printk( KERN_DEBUG "Unknown status\n");
             break;
     }
+#endif
 }
 
 static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioctl_param)
 {
 	int numargs = 0;
-	long ptrbuf[16];
-	long *ptr = ptrbuf;
+	unsigned long ptrbuf[16];
+	unsigned long *ptr = ptrbuf;
 	unsigned short ucode_size;
 	unsigned short thread_id;
 	char *ucode_buf;
 	//unsigned int counter;
 	char small_buffer[6]; //32 bits + char + \0
-	int CPUInfo[4]={-1};
+	unsigned long CPUInfo[4]={-1};
 	void (*apply_ucode_patch_p)(void *info);
 
 	switch(ioctl_num)
@@ -946,12 +944,12 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         #ifdef __x86_64__
 		ptr[1] = (uint32_t)(dtr.base >> 32);
         #else
-        ptr[1] = 0
+        ptr[1] = 0;
         #endif
 		ptr[2] = (uint32_t)dtr.base;
 
-		#pragma GCC diagnostic ignored "-Wuninitialized" dt_pa.u.high
-		#pragma GCC diagnostic ignored "-Wuninitialized" dt_pa.u.low
+		//#pragma GCC diagnostic ignored "-Wuninitialized" dt_pa.u.high
+		//#pragma GCC diagnostic ignored "-Wuninitialized" dt_pa.u.low
 		ptr[3] = dt_pa.u.high;
 		ptr[4] = dt_pa.u.low;
 
@@ -1104,12 +1102,12 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 			return -EFAULT;
 		break;
 	}
-    
+   
+#ifdef EFI_NOT_READY
 	case IOCTL_GET_EFIVAR:
 	{
 		//IN  params: data_size, guid, namelen, name
 		//OUT params: var_size, stat, data
- 
 		uint32_t *kbuf;
 		static efi_char16_t *name;
 		char *cptr, *var;
@@ -1220,7 +1218,6 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 
     case IOCTL_SET_EFIVAR:
     {
-    
         uint32_t *kbuf;
         static efi_char16_t *name;
         char *cptr, *data;
@@ -1333,8 +1330,8 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
         kfree(kbuf);
         
         break;
-
-    } 
+    }
+#endif
 
     case IOCTL_RDMMIO:
 	{
@@ -1443,6 +1440,49 @@ static long d_ioctl(struct file *file, unsigned int ioctl_num, unsigned long ioc
 #endif
 	}
 
+    case IOCTL_MSGBUS_SEND_MESSAGE:
+    {
+        //IN  params: direction, mcr, mcrx, mdr
+        //OUT params: mdr_out
+#ifdef CONFIG_X86
+        uint32_t direction, mcr, mcrx, mdr, mdr_out;
+        numargs = 5;
+        printk( KERN_INFO "[chipsec] > IOCTL_MSGBUS_SEND_MESSAGE\n");
+
+        if(copy_from_user((void*)ptrbuf, (void*)ioctl_param, (sizeof(long) * numargs)) > 0)
+            return -EFAULT;
+
+        mdr_out   = 0;		
+        direction = ptr[0];
+        mcr       = ptr[1];
+        mcrx      = ptr[2];
+        mdr       = ptr[3];
+
+        if (direction & MSGBUS_MDR_IN_MASK)
+            // Write data to MDR register
+            WritePCICfg( MSGBUS_BUS, MSGBUS_DEV, MSGBUS_FUN, MDR, 4, mdr );
+
+        // Write extended address to MCRX register if address is > 0xFF
+        if (mcrx != 0)
+            WritePCICfg( MSGBUS_BUS, MSGBUS_DEV, MSGBUS_FUN, MCRX, 4, mcrx );
+
+        // Write to MCR register to send the message on the message bus
+        WritePCICfg( MSGBUS_BUS, MSGBUS_DEV, MSGBUS_FUN, MCR, 4, mcr );
+
+        if (direction & MSGBUS_MDR_OUT_MASK) {
+            // Read data from MDR register
+            mdr_out = ReadPCICfg( MSGBUS_BUS, MSGBUS_DEV, MSGBUS_FUN, MDR, 4 );
+            ptr[4] = mdr_out;
+        }
+
+        if(copy_to_user((void*)ioctl_param, (void*)ptrbuf, (sizeof(long) * numargs)) > 0)
+          return -EFAULT;	
+        break;
+#else
+        return -EFAULT;
+#endif
+    }
+
    
 	default:
 		return -EFAULT;
@@ -1455,107 +1495,33 @@ static int open_port(struct inode * inode, struct file * filp)
 	return capable(CAP_SYS_RAWIO) ? 0 : -EPERM;
 }
 
-#define full_lseek      null_lseek
-#define read_full       read_zero
-#define open_mem	open_port
-#define open_fmem	open_port
-
 static const struct file_operations mem_fops = {
 	.llseek		= memory_lseek,
 	.read		= read_mem,
 	.write		= write_mem,
 	.mmap		= mmap_mem,
-	.open		= open_mem,
+	.open		= open_port,
 	.unlocked_ioctl	= d_ioctl,
 	.get_unmapped_area = get_unmapped_area_mem,
 };
 
-static int memory_open(struct inode * inode, struct file * filp)
-{
-	// no more kernel locking,
-	// let's hope it is safe;)
-	int ret = 0;
-
-	switch (iminor(inode)) {
-		case 1:
-			filp->f_op = &mem_fops;
-
-//Older kernels (<2.619) and New 4.X do not have directly_mappable_cdev_bdi
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,19) || LINUX_VERSION_CODE > KERNEL_VERSION(4,0,0)
-#else
-			filp->f_mapping->backing_dev_info =
-				&directly_mappable_cdev_bdi;
-#endif 
-			break;
-
-		default:
-			return -ENXIO;
-	}
-	if (filp->f_op && filp->f_op->open)
-		ret = filp->f_op->open(inode,filp);
-	return ret;
-}
-
-static const struct file_operations memory_fops = {
-	.open		= memory_open,	/* just a selector for the real open */
+static struct miscdevice chipsec_dev = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name = "chipsec",
+    .fops = &mem_fops
 };
-
-static const struct {
-	unsigned int		minor;
-	char			*name;
-	umode_t			mode;
-	const struct file_operations	*fops;
-} devlist[] = { /* list of minor devices */
-	{1, "chipsec",     S_IRUSR | S_IWUSR | S_IRGRP, &mem_fops},
-};
-
-static struct class *mem_class;
-
-
-// This function actually creates device itself.
-static int __init chr_dev_init(void)
-{
-	int i;
-
-	// get dynamic major num
-	chipsec_mem_major = register_chrdev(0, "chipsec", &memory_fops);
-	if(chipsec_mem_major < 0){
-		printk(KERN_ALERT "Registering chipsec dev failed with %d\n", chipsec_mem_major);
-		return chipsec_mem_major;
-	}
-
-	mem_class = class_create(THIS_MODULE, "chipsec");
-	for (i = 0; i < ARRAY_SIZE(devlist); i++){
-
-//Older kernels have one less parameter
-#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,26)
-		device_create(mem_class, NULL,MKDEV(chipsec_mem_major, devlist[i].minor), devlist[i].name);
-#else
-		device_create(mem_class, NULL,MKDEV(chipsec_mem_major, devlist[i].minor), NULL, devlist[i].name);
-#endif 
-	}
-
-	return 0;
-}
-
 
 int find_symbols(void) 
 {
 	//Older kernels don't have kallsyms_lookup_name. Use FMEM method (pass from run.sh)
 	#if LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,33)
-		printk("Chipsec warning: Using function addresses provided by run.sh");
+		printk("Chipsec warning: Using function address provided by run.sh");
 		guess_page_is_ram=(void *)a1;
 		dbgprint ("set guess_page_is_ram: %p\n",guess_page_is_ram);
-		guess_raw_pci_read=(void *)a2;
-		printk ("set guess_raw_pci_read: %p\n",guess_raw_pci_read);
-		guess_raw_pci_write=(void *)a3;
-		printk ("set guess_raw_pci_write: %p\n",guess_raw_pci_write);
 	#else
-		guess_page_is_ram   = (void *)kallsyms_lookup_name("page_is_ram");
-		guess_raw_pci_read  = (void *)kallsyms_lookup_name("raw_pci_read");
-		guess_raw_pci_write = (void *)kallsyms_lookup_name("raw_pci_write");
+		guess_page_is_ram = (void *)kallsyms_lookup_name("page_is_ram");
 
-		if(guess_page_is_ram == 0 || guess_raw_pci_read == 0 || guess_raw_pci_write == 0)
+		if(guess_page_is_ram == 0)
 		{
 			printk("Chipsec find_symbols failed. Unloading module");
 			return -1;
@@ -1568,20 +1534,25 @@ int find_symbols(void)
 int __init
 init_module (void)
 {
-	int sym_status = 0;
+	int ret = 0;
 	printk(KERN_ALERT "Chipsec module loaded \n");
 	printk(KERN_ALERT "** This module exposes hardware & memory access, **\n");
 	printk(KERN_ALERT "** which can effect the secure operation of      **\n");
 	printk(KERN_ALERT "** production systems!! Use for research only!   **\n");
 
-	sym_status = find_symbols();
-	chr_dev_init();  
-	if(sym_status) 
+	ret = find_symbols();
+	if (ret)
 	{
 		printk("Chipsec symbol lookup failed\n");
-		cleanup_module();
 		return -1;
 	}
+	ret = misc_register(&chipsec_dev);
+	if (ret)
+	{
+		printk("Unable to register the chipsec device\n");
+		return ret;
+	}
+
 	return 0;
 }
 
@@ -1589,8 +1560,6 @@ init_module (void)
 void cleanup_module (void)
 {
 	dbgprint ("Destroying chipsec device");
-	unregister_chrdev(chipsec_mem_major, "chipsec");
-	device_destroy(mem_class, MKDEV(chipsec_mem_major, 1));
-	class_destroy(mem_class);
+	misc_deregister(&chipsec_dev);
 	dbgprint ("exit");
 }

@@ -37,8 +37,7 @@ PyDoc_STRVAR(edk2__doc__,
              corresponding UEFI Specification entries for more information on calls.");
 
 //
-// Original CHIPSEC extension for Python 2.4 port on EFI x86 - Jeff Forristal
-// CHIPSEC extension for Python 2.7.2 port on UEFI/UDK2010 x64 - Yuriy Bulygin
+// CHIPSEC extension for Python 2.7.2 port on UEFI/UDK2010 x64
 //
 #ifndef CHIPSEC
   #define CHIPSEC 1
@@ -2698,7 +2697,10 @@ async_system(const char *command)
     if (strlen(shell) + 3 + strlen(command) >= 1024)
         return ERROR_NOT_ENOUGH_MEMORY
 
-    args[0] = '\0';
+    for(int i = 0; i<1024; i++)
+    {
+    	args[i] = '\0';
+    }
     strcat(args, shell);
     strcat(args, "/c ");
     strcat(args, command);

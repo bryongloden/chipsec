@@ -1,6 +1,6 @@
 #!/usr/local/bin/python
 #CHIPSEC: Platform Security Assessment Framework
-#Copyright (c) 2010-2015, Intel Corporation
+#Copyright (c) 2010-2016, Intel Corporation
 # 
 #This program is free software; you can redistribute it and/or
 #modify it under the terms of the GNU General Public License
@@ -68,6 +68,8 @@ def parse_script( script, log_script=False ):
 
     while (off < len_s) and (entry_type != S3BootScriptOpcode.EFI_BOOT_SCRIPT_TERMINATE_OPCODE):
         entry_type,s3script_entry = parse_s3bootscript_entry( script_type, script, off, log_script )
+        # couldn't parse the next entry - return what has been parsed so far
+        if s3script_entry is None: return s3_boot_script_entries
         s3_boot_script_entries.append( s3script_entry )
         off += s3script_entry.length
 
@@ -235,6 +237,17 @@ def decode_EFI_variables( efi_vars, nvram_pth ):
             n = n+1
 
 
+def identify_EFI_NVRAM( buffer ):
+    b = "".join( buffer )
+    for fw_type in fw_types:
+    #for t in EFI_VAR_DICT.keys():            
+        if EFI_VAR_DICT[ fw_type ]['func_getnvstore']:
+            (offset, size, hdr) = EFI_VAR_DICT[ fw_type ]['func_getnvstore']( b )
+            if offset != -1: return fw_type
+
+    return None
+
+
 ########################################################################################################
 #
 # UEFI HAL Component
@@ -349,6 +362,7 @@ NVRAM: EFI Variable Store
 
         return True
 
+
     def decompress_EFI_binary( self, compressed_name, uncompressed_name, compression_type ):
         if logger().HAL: logger().log( "[uefi] decompressing EFI binary (type = 0x%X)\n       %s ->\n       %s" % (compression_type,compressed_name,uncompressed_name) )
         if compression_type in COMPRESSION_TYPES:
@@ -443,7 +457,7 @@ NVRAM: EFI Variable Store
             # Decode the S3 Resume Boot-Script into a sequence of operations/opcodes
             #
             # @TODO: should be dumping memory contents in a loop until end opcode is found or id'ing actual size
-            script_buffer = self.helper.read_physical_mem( bootscript_pa, 0x100000 )
+            script_buffer = self.helper.read_physical_mem( bootscript_pa, 0x200000 )
             if logger().HAL: logger().log( '[uefi] Decoding S3 Resume Boot-Script..' )
             script_entries = parse_script( script_buffer, log_script )               
             parsed_scripts[ bootscript_pa ] = script_entries
@@ -466,23 +480,22 @@ NVRAM: EFI Variable Store
                 print_buffer( var )
         return var
 
-    def set_EFI_variable( self, name, guid, var, attrs=None ):
-        if logger().UTIL_TRACE or logger().VERBOSE:
+    def set_EFI_variable( self, name, guid, var, datasize=None, attrs=None ):
+        if logger().HAL:
             logger().log( '[uefi] writing EFI variable %s:%s %s' % (guid, name, '' if attrs is None else ('(attributes = %s)' % attrs)) )
             #print_buffer( var )
-        return self.helper.set_EFI_variable( name, guid, var, attrs )
-
-    def set_EFI_variable_from_file( self, name, guid, filename, attrs=None ):
+        return self.helper.set_EFI_variable( name, guid, var, datasize, attrs )
+        
+    def set_EFI_variable_from_file( self, name, guid, filename, datasize=None, attrs=None ):
         if filename is None:
             logger().error( 'File with EFI variable is not specified' )
             return False
         var = read_file( filename )
-        return self.set_EFI_variable( name, guid, var, attrs )
+        return self.set_EFI_variable( name, guid, var, datasize, attrs )
 
-    def delete_EFI_variable( self, name, guid, attrs=None ):
-        if logger().UTIL_TRACE or logger().VERBOSE:
-            logger().log( '[uefi] deleting EFI variable %s:%s %s' % (guid, name, '' if attrs is None else ('(attributes = %s)' % attrs)) )
-        return self.helper.set_EFI_variable( name, guid, None, attrs )
+    def delete_EFI_variable( self, name, guid ):
+        if logger().HAL: logger().log( '[uefi] deleting EFI variable %s:%s' % (guid, name) )
+        return self.helper.delete_EFI_variable( name, guid )
 
 
     ######################################################################
@@ -493,7 +506,7 @@ NVRAM: EFI Variable Store
         (smram_base,smram_limit,smram_size) = self.cs.cpu.get_SMRAM()
         CHUNK_SZ = 1024*1024 # 1MB
         if logger().HAL: logger().log( "[uefi] searching memory for EFI table with signature '%s' .." % table_sig )
-        table,table_buf = None,None
+        table_pa,table_header,table,table_buf = None,None,None,None
         pa = smram_base - CHUNK_SZ
         isFound = False
         while pa > CHUNK_SZ:
@@ -502,7 +515,7 @@ NVRAM: EFI Variable Store
             pos = membuf.find( table_sig )
             if -1 != pos:
                 table_pa = pa + pos
-                if logger().VERBOSE: logger().log( '[uefi] found EFI table signature at 0x%016X..' % table_pa )
+                if logger().VERBOSE: logger().log( "[uefi] found signature '%s' at 0x%016X.." % (table_sig,table_pa) )
                 if pos < (CHUNK_SZ - EFI_TABLE_HEADER_SIZE):
                     hdr = membuf[ pos : pos + EFI_TABLE_HEADER_SIZE ]
                 else:
@@ -514,7 +527,7 @@ NVRAM: EFI Variable Store
                    table_header.Revision not in EFI_REVISIONS or \
                    table_header.HeaderSize > MAX_EFI_TABLE_SIZE:
                     if logger().VERBOSE:
-                        logger().log( "[uefi] Found '%s' at 0x%016X but doesn't look like an actual table. keep searching.." % (table_sig,table_pa) )
+                        logger().log( "[uefi] found '%s' at 0x%016X but doesn't look like an actual table. keep searching.." % (table_sig,table_pa) )
                         logger().log( table_header )
                 else:
                     isFound = True
@@ -555,16 +568,16 @@ NVRAM: EFI Variable Store
         (isFound,est_pa,est_header,est,est_buf) = self.find_EFI_System_Table()
         if isFound and est is not None:
             if 0 != est.BootServices:
-                logger().log( "[uefi] UEFI appears to be in Boot mode" )
+                if logger().HAL: logger().log( "[uefi] UEFI appears to be in Boot mode" )
                 ect_pa = est.ConfigurationTable
             else:
-                logger().log( "[uefi] UEFI appears to be in Runtime mode" )
+                if logger().HAL: logger().log( "[uefi] UEFI appears to be in Runtime mode" )
                 ect_pa = self.cs.mem.va2pa( est.ConfigurationTable )
                 if not ect_pa:
-                    print "[uefi] Cann't find UEFI ConfigurationTable"
+                    logger().error( "Can't find UEFI ConfigurationTable" )
                     return (None,ect_pa,ect,ect_buf)
 
-        logger().log( "[uefi] EFI Configuration Table (%d entries): VA = 0x%016X, PA = 0x%016X" % (est.NumberOfTableEntries,est.ConfigurationTable,ect_pa) )
+        if logger().HAL: logger().log( "[uefi] EFI Configuration Table (%d entries): VA = 0x%016X, PA = 0x%016X" % (est.NumberOfTableEntries,est.ConfigurationTable,ect_pa) )
 
         found = (ect_pa is not None)
         if found:

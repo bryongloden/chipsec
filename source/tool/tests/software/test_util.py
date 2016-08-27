@@ -48,94 +48,145 @@ class TestChipsecUtil(unittest.TestCase):
         chipsec_util._cs = chipset.cs()
         util = chipsec_util.ChipsecUtil()
         util.VERBOSE = True
+        logger.logger().HAL = True
         util.set_logfile(self.log_file)
         err_code = util.main(["chipsec_utils.py"] + arg.split())
         logger.logger().close()
         self.log = open(self.log_file).read()
         self.assertEqual(err_code, 0)
 
+    def _assertLogValue(self, name, value):
+        """Shortcut to validate the output.
+
+        Assert that at least one line exists within the log which matches the
+        expression: name [:=] value.
+        """
+        self.assertRegexpMatches(self.log,
+                                 r'(^|\W){}\s*[:=]\s*{}($|\W)'.format(name, value))
+
     def test_acpi_xsdt_list(self):
 
-        class ACPIHelper(mock_helper.TestHelper):
+        class ACPIHelper(mock_helper.ACPIHelper):
 
-            RSDP_DESCRIPTOR = ("RSD PTR " +               # Signature
-                               struct.pack("<B", 0x1) +   # Checksum
-                               "TEST00" +                 # OEMID
-                               struct.pack("<B", 0x2) +   # Revision
-                               struct.pack("<I", 0x200) + # RSDT Address
-                               struct.pack("<I", 0x0) +   # Length
-                               struct.pack("<Q", 0x100) + # XSDT Address
-                               struct.pack("<B", 0x0) +   # Extended Checksum
-                               "AAA")                     # Reserved
+            USE_RSDP_REV_0 = False
 
-            XSDT_DESCRIPTOR = ("XSDT" +                  # Signature
-                               struct.pack("<I", 0x32) + # Length
-                               struct.pack("<B", 0x1) +  # Revision
-                               struct.pack("<B", 0x1) +  # Checksum
-                               "OEMIDT" +                # OEMID
-                               "OEMTBLID" +              # OEM Table ID
-                               "OEMR" +                  # OEM Revision
-                               "CRID" +                  # Creator ID
-                               "CRRV" +                  # Creator Revision
-                               struct.pack("<Q", 0x400)) # Address of table
-
-            EBDA_ADDRESS = 0x96000
-            EBDA_PADDING = 0x100
-            RSDP_ADDRESS = EBDA_ADDRESS + EBDA_PADDING
+            def __init__(self):
+                super(ACPIHelper, self).__init__()
+                self._add_entry_to_xsdt(0x400)
 
             def read_phys_mem(self, pa_hi, pa_lo, length):
-                if pa_lo == 0x40E:
-                    return struct.pack("<H", self.EBDA_ADDRESS >> 4)
-                elif pa_lo >= self.EBDA_ADDRESS and \
-                     pa_lo < self.RSDP_ADDRESS + len(self.RSDP_DESCRIPTOR):
-                    mem = "\x00" * self.EBDA_PADDING + self.RSDP_DESCRIPTOR
-                    offset = pa_lo - self.EBDA_ADDRESS
-                    return mem[offset:offset+length]
-                elif pa_lo == 0x100:
-                    return self.XSDT_DESCRIPTOR[:length]
-                elif pa_lo == 0x400:
+                if pa_lo == 0x400:
                     return "EFGH"
+                else:
+                    return super(ACPIHelper, self).read_phys_mem(pa_hi, pa_lo, length)
 
         self._chipsec_util("acpi list", ACPIHelper)
-        self.assertIn("EFGH: 0x0000000000000400", self.log)
+        self._assertLogValue("EFGH", "0x0000000000000400")
 
     def test_acpi_rsdt_list(self):
 
-        class ACPIHelper(mock_helper.TestHelper):
+        class ACPIHelper(mock_helper.ACPIHelper):
 
-            RSDP_DESCRIPTOR = ("RSD PTR " +               # Signature
-                               struct.pack("<B", 0x1) +   # Checksum
-                               "TEST00" +                 # OEMID
-                               struct.pack("<B", 0x0) +   # Revision
-                               struct.pack("<I", 0x200))  # RSDT Address
+            def __init__(self):
+                super(ACPIHelper, self).__init__()
+                self._add_entry_to_rsdt(0x300)
 
-            RSDT_DESCRIPTOR = ("RSDT" +                  # Signature
-                               struct.pack("<I", 0x28) + # Length
+            def read_phys_mem(self, pa_hi, pa_lo, length):
+                if pa_lo >= self.EBDA_ADDRESS and \
+                    pa_lo < self.RSDP_ADDRESS + len(self.rsdp_descriptor):
+                    # Simulate a condition where there is no RSDP in EBDA
+                    return "\xFF" * length
+                elif pa_lo == 0xE0000:
+                    return self.rsdp_descriptor[:length]
+                elif pa_lo == 0x300:
+                    return "ABCD"
+                else:
+                    return super(ACPIHelper, self).read_phys_mem(pa_hi, pa_lo, length)
+
+        self._chipsec_util("acpi list", ACPIHelper)
+        self._assertLogValue("ABCD", "0x0000000000000300")
+
+    def test_acpi_facp_list(self):
+        self._chipsec_util("acpi table FACP", mock_helper.DSDTParsingHelper)
+        self._assertLogValue("DSDT", "0x00000000")
+        self._assertLogValue("X_DSDT", "0x0000000000000000")
+
+    def test_mismatch_dsdt_x_dsdt_error(self):
+
+        class DSDTParsingHelper(mock_helper.DSDTParsingHelper):
+
+            DSDT_ADDRESS = 0x400
+            X_DSDT_ADDRESS = 0x312
+
+        self._chipsec_util("acpi table FACP", DSDTParsingHelper)
+        self._assertLogValue("DSDT", "0x00000400")
+        self._assertLogValue("X_DSDT", "0x0000000000000312")
+        self.assertIn("Unable to determine the correct DSDT address", self.log)
+
+    def test_mismatch_dsdt_x_dsdt_ok_dsdt_zero(self):
+
+        class DSDTParsingHelper(mock_helper.DSDTParsingHelper):
+
+            DSDT_ADDRESS = 0x0
+            X_DSDT_ADDRESS = 0x400
+
+        self._chipsec_util("acpi table FACP", DSDTParsingHelper)
+        self._assertLogValue("DSDT", "0x00000000")
+        self._assertLogValue("X_DSDT", "0x0000000000000400")
+        self.assertNotIn("Unable to determine the correct DSDT address", self.log)
+
+    def test_mismatch_dsdt_x_dsdt_ok_x_dsdt_zero(self):
+
+        class DSDTParsingHelper(mock_helper.DSDTParsingHelper):
+
+            DSDT_ADDRESS = 0x400
+            X_DSDT_ADDRESS = 0x0
+
+        self._chipsec_util("acpi table FACP", DSDTParsingHelper)
+        self._assertLogValue("DSDT", "0x00000400")
+        self._assertLogValue("X_DSDT", "0x0000000000000000")
+        self.assertNotIn("Unable to determine the correct DSDT address", self.log)
+
+    def test_no_x_dsdt(self):
+
+        class DSDTParsingHelper(mock_helper.DSDTParsingHelper):
+
+            USE_FADT_WITH_X_DSDT = False
+            DSDT_ADDRESS = 0x400
+
+        self._chipsec_util("acpi table FACP", DSDTParsingHelper)
+        self._assertLogValue("DSDT", "0x00000400")
+        self._assertLogValue("X_DSDT", "Not found")
+        self.assertIn("Cannot find X_DSDT entry in FADT.", self.log)
+
+    def test_show_dsdt(self):
+
+        class DSDTParsingHelper(mock_helper.DSDTParsingHelper):
+
+            DSDT_ADDRESS = 0x600
+
+            DSDT_DESCRIPTOR = ("DSDT" +                  # Signature
+                               struct.pack("<I", 0x30) + # Length
                                struct.pack("<B", 0x1) +  # Revision
                                struct.pack("<B", 0x1) +  # Checksum
-                               "OEMIDT" +                # OEMID
+                               "OEMDSD" +                # OEMID
                                "OEMTBLID" +              # OEM Table ID
                                "OEMR" +                  # OEM Revision
                                "CRID" +                  # Creator ID
                                "CRRV" +                  # Creator Revision
-                               struct.pack("<I", 0x300)) # Address of table
+                               struct.pack("<Q", 0x129)) # AML code
 
             def read_phys_mem(self, pa_hi, pa_lo, length):
-                if pa_lo == 0xE0000:
-                    return self.RSDP_DESCRIPTOR[:length]
-                elif pa_lo == 0x200:
-                    return self.RSDT_DESCRIPTOR[:length]
-                elif pa_lo == 0x300:
-                    return "ABCD"
+                if pa_lo == self.DSDT_ADDRESS:
+                    return self.DSDT_DESCRIPTOR[:length]
                 else:
-                    return "\xFF" * length
+                    return super(DSDTParsingHelper, self).read_phys_mem(pa_hi, pa_lo, length)
 
-        self._chipsec_util("acpi list", ACPIHelper)
-        self.assertIn("ABCD: 0x0000000000000300", self.log)
+        self._chipsec_util("acpi table DSDT", DSDTParsingHelper)
+        self.assertIn("OEMDSD", self.log)
 
     def test_platform(self):
         self._chipsec_util("platform")
-
 
     def test_cmos_dump(self):
         """Test to verify the output of 'cmos dump'.
@@ -169,7 +220,8 @@ class TestChipsecUtil(unittest.TestCase):
                     return [0x0, 0x0]
 
         self._chipsec_util("msr 0x2FF", MSRHelper)
-        self.assertIn("EAX=00001234, EDX=0000CDEF", self.log)
+        self._assertLogValue("EAX", "00001234")
+        self._assertLogValue("EDX", "0000CDEF")
 
     def test_gdt(self):
 
@@ -191,44 +243,92 @@ class TestChipsecUtil(unittest.TestCase):
         Validates that BC and FRAP are correctly read.
         """
 
-        class SPIHelper(mock_helper.TestHelper):
+        self._chipsec_util("spi info", mock_helper.SPIHelper)
+        self._assertLogValue("BC", "0xDEADBEEF")
+        self._assertLogValue("FRAP", "0xEEEEEEEE")
 
-            RCBA_ADDR = 0xFED0000
-            SPIBAR_ADDR = RCBA_ADDR + 0x3800
-            SPIBAR_END = SPIBAR_ADDR + 0x200
-            FRAP = SPIBAR_ADDR + 0x50
-            FREG0 = SPIBAR_ADDR + 0x54
-            LPC_BRIDGE_DEVICE = (0, 0x1F, 0)
+    def test_spi_dump(self):
+        """Test to verify the ouput of 'spi dump'.
 
-            def read_pci_reg(self, bus, device, function, address, size):
-                if (bus, device, function) == self.LPC_BRIDGE_DEVICE:
-                    if address == 0xF0:
-                        return self.RCBA_ADDR
-                    elif address == 0xDC:
-                        return 0xDEADBEEF
-                    else:
-                        raise Exception("Unexpected PCI read")
+        Validates that the flash size is correctly calculated (based on the
+        assumption that the BIOS region is last) and match it with the output
+        file size.
+        """
+
+        fileno, rom_file = tempfile.mkstemp()
+        os.close(fileno)
+        self._chipsec_util("spi dump %s" % rom_file, mock_helper.SPIHelper)
+        self.assertEqual(os.stat(rom_file).st_size, 0x3000)
+        os.remove(rom_file)
+
+    def test_parse_multi_table(self):
+        """Test to verify that tables with same signature are parsed correctly.
+
+        Since usually there are several SSDT tables with the same signature, we test SSDT parsing.
+        """
+
+        class SSDTParsingHelper(mock_helper.ACPIHelper):
+            """Test helper containing generic descriptor for SSDT to parse SSDT
+
+            Three regions are defined:
+              * SSDT table [0x400, 0x430]
+              * SSDT table [0x600, 0x630]
+              * SSDT table [0x800, 0x830]
+            """
+            SSDT1_DESCRIPTOR = ("SSDT" +                  # Signature
+                                struct.pack("<I", 0x30) + # Length
+                                struct.pack("<B", 0x1) +  # Revision
+                                struct.pack("<B", 0x1) +  # Checksum
+                                "OEMSS1" +                # OEMID
+                                "OEMTBLID" +              # OEM Table ID
+                                "OEMR" +                  # OEM Revision
+                                "CRID" +                  # Creator ID
+                                "CRRV" +                  # Creator Revision
+                                struct.pack("<Q", 0x129)) # AML code
+
+            SSDT2_DESCRIPTOR = ("SSDT" +                  # Signature
+                                struct.pack("<I", 0x30) + # Length
+                                struct.pack("<B", 0x1) +  # Revision
+                                struct.pack("<B", 0x1) +  # Checksum
+                                "OEMSS2" +                # OEMID
+                                "OEMTBLID" +              # OEM Table ID
+                                "OEMR" +                  # OEM Revision
+                                "CRID" +                  # Creator ID
+                                "CRRV" +                  # Creator Revision
+                                struct.pack("<Q", 0x929)) # AML code
+
+            SSDT3_DESCRIPTOR = ("SSDT" +                  # Signature
+                                struct.pack("<I", 0x30) + # Length
+                                struct.pack("<B", 0x1) +  # Revision
+                                struct.pack("<B", 0x1) +  # Checksum
+                                "OEMSS3" +                # OEMID
+                                "OEMTBLID" +              # OEM Table ID
+                                "OEMR" +                  # OEM Revision
+                                "CRID" +                  # Creator ID
+                                "CRRV" +                  # Creator Revision
+                                struct.pack("<Q", 0x199)) # AML code
+
+            def __init__(self):
+                super(SSDTParsingHelper, self).__init__()
+                self._add_entry_to_rsdt(0x400)
+                self._add_entry_to_rsdt(0x600)
+                self._add_entry_to_rsdt(0x800)
+
+            def read_phys_mem(self, pa_hi, pa_lo, length):
+                if pa_lo == 0x400:
+                    return self.SSDT1_DESCRIPTOR[:length]
+                elif pa_lo == 0x600:
+                    return self.SSDT2_DESCRIPTOR[:length]
+                elif pa_lo == 0x800:
+                    return self.SSDT3_DESCRIPTOR[:length]
                 else:
-                    return super(SPIHelper, self).read_pci_reg(bus, device,
-                                                               function,
-                                                               address, size)
+                    return super(SSDTParsingHelper, self).read_phys_mem(pa_hi, pa_lo, length)
 
-            def read_mmio_reg(self, pa, size):
-                if pa == self.FREG0:
-                    return 0x11111111
-                elif pa == self.FREG0 + 4:
-                    return 0x22222222
-                elif pa == self.FRAP:
-                    return 0xEEEEEEEE
-                elif pa >= self.SPIBAR_ADDR and pa < self.SPIBAR_END:
-                    return 0x0
-                else:
-                    raise Exception("Unexpected address")
-
-            def write_mmio_reg(self, pa, size, value):
-                if pa < self.SPIBAR_ADDR or pa > self.SPIBAR_END:
-                    raise Exception("Write to outside of SPIBAR")
-
-        self._chipsec_util("spi info", SPIHelper)
-        self.assertIn("BC = 0xDEADBEEF", self.log)
-        self.assertIn("FRAP = 0xEEEEEEEE", self.log)
+        self._chipsec_util("acpi list", SSDTParsingHelper)
+        self._assertLogValue("SSDT", ("0x0000000000000400, "
+                                      "0x0000000000000600, "
+                                      "0x0000000000000800"))
+        self._chipsec_util("acpi table SSDT", SSDTParsingHelper)
+        self.assertIn("OEMSS1", self.log)
+        self.assertIn("OEMSS2", self.log)
+        self.assertIn("OEMSS3", self.log)

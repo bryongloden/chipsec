@@ -24,83 +24,131 @@
 
 __version__ = '1.0'
 
-import os
-import sys
 import time
 
-import chipsec_util
 import chipsec.hal.cpu
-
-from chipsec.logger             import *
+from chipsec.command import BaseCommand
 
 # ###################################################################
 #
 # CPU utility
 #
 # ###################################################################
-def cpu_cmd( argv ):
+class CPUCommand(BaseCommand):
     """
     >>> chipsec_util cpu info
     >>> chipsec_util cpu cr <cpu_id> <cr_number> [value]
+    >>> chipsec_util cpu cpuid <eax> [ecx]
+    >>> chipsec_util cpu pt [paging_base_cr3]
 
     Examples:
 
     >>> chipsec_util cpu info
     >>> chipsec_util cpu cr 0 0
     >>> chipsec_util cpu cr 0 4 0x0
+    >>> chipsec_util cpu cpuid 40000000
+    >>> chipsec_util cpu pt
     """
-    if len(argv) < 3:
-        print cpu_cmd.__doc__
-        return
-    op = argv[2]
-    t = time.time()
 
-    try:
-        _cpu = chipsec.hal.cpu.CPU( chipsec_util._cs )
-    except chipsec.hal.cpu.CPURuntimeError, msg:
-        print msg
-        return
+    def requires_driver(self):
+        # No driver required when printing the util documentation
+        if len(self.argv) < 3:
+            return False
+        return True
 
-    #_cpu = chipsec_util._cs.cpu
-
-    if 'info' == op:
-        logger().log( "[CHIPSEC] CPU information:" )
-        ht               = _cpu.is_HT_active()      
-        threads_per_core = _cpu.get_number_logical_processor_per_core()
-        threads_per_pkg  = _cpu.get_number_logical_processor_per_package()
-        cores_per_pkg    = _cpu.get_number_physical_processor_per_package()
-        threads_count    = _cpu.get_number_threads_from_APIC_table()
-        sockets_count    = _cpu.get_number_sockets_from_APIC_table()
-        logger().log( "          Hyper-Threading         : %s" % ('Enabled' if ht else 'Disabled') )
-        logger().log( "          CPU cores per package   : %d" % cores_per_pkg )
-        logger().log( "          CPU threads per core    : %d" % threads_per_core )
-        logger().log( "          CPU threads per package : %d" % threads_per_pkg )
-        logger().log( "          Number of sockets       : %d" % sockets_count )
-        logger().log( "          Number of CPU threads   : %d" % threads_count )
-
-    elif 'cr' == op:
-        if len(argv) < 5:
-            print cpu_cmd.__doc__
+    def run(self):
+        if len(self.argv) < 3:
+            print CPUCommand.__doc__
             return
+        op = self.argv[2]
+        t = time.time()
 
-        cpu_thread_id = int(argv[3],10)
-        cr_number     = int(argv[4],16)
+        if 'info' == op:
+            self.logger.log( "[CHIPSEC] CPU information:" )
+            ht               = self.cs.cpu.is_HT_active()      
+            threads_per_core = self.cs.cpu.get_number_logical_processor_per_core()
+            threads_per_pkg  = self.cs.cpu.get_number_logical_processor_per_package()
+            cores_per_pkg    = self.cs.cpu.get_number_physical_processor_per_package()
+            self.logger.log( "          Hyper-Threading         : %s" % ('Enabled' if ht else 'Disabled') )
+            self.logger.log( "          CPU cores per package   : %d" % cores_per_pkg )
+            self.logger.log( "          CPU threads per core    : %d" % threads_per_core )
+            self.logger.log( "          CPU threads per package : %d" % threads_per_pkg )
+            try:
+                threads_count = self.cs.cpu.get_number_threads_from_APIC_table()
+                sockets_count = self.cs.cpu.get_number_sockets_from_APIC_table()
+                self.logger.log( "          Number of sockets       : %d" % sockets_count )
+                self.logger.log( "          Number of CPU threads   : %d" % threads_count )
+            except:
+                pass
 
-        if len(argv) > 5:
-            value = int(argv[5], 16)
-            logger().log( "[CHIPSEC] CPU: %d write CR%d <- 0x%08X" % (cpu_thread_id, cr_number, value) )
-            chipsec_util._cs.cpu.write_cr( cpu_thread_id, cr_number, value )
-            return True
+        elif 'cr' == op:
+
+            if len(self.argv) > 5:
+                cpu_thread_id = int(self.argv[3],10)
+                cr_number     = int(self.argv[4],16)
+                value         = int(self.argv[5], 16)
+                self.logger.log( "[CHIPSEC] CPU%d: write CR%d <- 0x%08X" % (cpu_thread_id, cr_number, value) )
+                self.cs.cpu.write_cr( cpu_thread_id, cr_number, value )
+                return True
+            elif len(self.argv) > 4:
+                cpu_thread_id = int(self.argv[3],10)
+                cr_number     = int(self.argv[4],16)
+                value = self.cs.cpu.read_cr( cpu_thread_id, cr_number )
+                self.logger.log( "[CHIPSEC] CPU%d: read CR%d -> 0x%08X" % (cpu_thread_id, cr_number, value) )
+                return value
+            else:
+                for tid in range(self.cs.msr.get_cpu_thread_count()):
+                    cr0 = self.cs.cpu.read_cr( tid, 0 )
+                    cr2 = self.cs.cpu.read_cr( tid, 2 )
+                    cr3 = self.cs.cpu.read_cr( tid, 3 )
+                    cr4 = self.cs.cpu.read_cr( tid, 4 )
+                    cr8 = self.cs.cpu.read_cr( tid, 8 )
+                    self.logger.log( "[CHIPSEC][cpu%d] x86 Control Registers:" % tid )
+                    self.logger.log( "  CR0: 0x%016X" % cr0 )
+                    self.logger.log( "  CR2: 0x%016X" % cr2 )
+                    self.logger.log( "  CR3: 0x%016X" % cr3 )
+                    self.logger.log( "  CR4: 0x%016X" % cr4 )
+                    self.logger.log( "  CR8: 0x%016X" % cr8 )
+
+        elif 'cpuid' == op:
+            if len(self.argv) < 4:
+                print CPUCommand.__doc__
+                return
+
+            eax = int(self.argv[3],16)
+            ecx = int(self.argv[4],16) if 5 == len(self.argv) else 0
+
+            self.logger.log( "[CHIPSEC] CPUID < EAX: 0x%08X" % eax)
+            self.logger.log( "[CHIPSEC]         ECX: 0x%08X" % ecx)
+
+            (_eax,_ebx,_ecx,_edx) = self.cs.cpu.cpuid( eax, ecx )
+
+            self.logger.log( "[CHIPSEC] CPUID > EAX: 0x%08X" % _eax )
+            self.logger.log( "[CHIPSEC]         EBX: 0x%08X" % _ebx )
+            self.logger.log( "[CHIPSEC]         ECX: 0x%08X" % _ecx )
+            self.logger.log( "[CHIPSEC]         EDX: 0x%08X" % _edx )
+        
+        elif op == "pt":
+
+            if len(self.argv) == 4:
+                cr3 = int(self.argv[3],16) 
+                pt_fname = 'pt_%08X' % cr3
+                self.logger.log( "[CHIPSEC] paging physical base (CR3): 0x%016X" % cr3 )
+                self.logger.log( "[CHIPSEC] dumping paging hierarchy to '%s'..." % pt_fname )
+                self.cs.cpu.dump_page_tables( cr3, pt_fname )
+            else:
+                for tid in range(self.cs.msr.get_cpu_thread_count()):
+                    cr3 = self.cs.cpu.read_cr( tid, 3 )
+                    pt_fname = 'cpu%d_pt_%08X' % (tid,cr3)
+                    self.logger.log( "[CHIPSEC][cpu%d] paging physical base (CR3): 0x%016X" % (tid,cr3) )
+                    self.logger.log( "[CHIPSEC][cpu%d] dumping paging hierarchy to '%s'..." % (tid,pt_fname) )
+                    self.cs.cpu.dump_page_tables( cr3, pt_fname )
+
         else:
-            value = chipsec_util._cs.cpu.read_cr( cpu_thread_id, cr_number )
-            logger().log( "[CHIPSEC] CPU: %d read CR%d -> 0x%08X" % (cpu_thread_id, cr_number, value) )
-            return value
-
-    else:
-        print cpu_cmd.__doc__
-        return
-    
-    logger().log( "[CHIPSEC] (cpu) time elapsed %.3f" % (time.time()-t) )
+            print CPUCommand.__doc__
+            return
+        
+        self.logger.log( "[CHIPSEC] (cpu) time elapsed %.3f" % (time.time()-t) )
 
 
-chipsec_util.commands['cpu'] = {'func' : cpu_cmd, 'start_driver' : True, 'help' : cpu_cmd.__doc__  }
+commands = { 'cpu': CPUCommand }
